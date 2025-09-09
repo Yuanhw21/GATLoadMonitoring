@@ -1,0 +1,29 @@
+# config.yaml
+file_path: '../data/data.csv'
+devices:
+  - 'Unknown'
+  - 'WashingMachine'
+  - 'Dishwasher'
+  - 'Dryer'
+  - 'Television'
+  - 'Computer'
+model_save_path: "../models/model.pth"
+window_size: 5
+correlation_threshold: 0.1
+gat:
+  num_epochs: 20
+  batch_size: 32
+  optimizer:
+    type: "Adam"
+    learning_rate: 0.001
+  loss_function:
+    type: "MSELoss"
+
+gat_lstm:
+  num_epochs: 25
+  batch_size: 32
+  optimizer:
+    type: "Adam"
+    learning_rate: 0.001
+  loss_function:
+    type: "MSELoss"
