@@ -7,23 +7,36 @@ devices:
   - 'Dryer'
   - 'Television'
   - 'Computer'
-model_save_path: "../models/model.pth"
-window_size: 5
-correlation_threshold: 0.1
-gat:
-  num_epochs: 20
-  batch_size: 32
-  optimizer:
-    type: "Adam"
-    learning_rate: 0.001
-  loss_function:
-    type: "MSELoss"
+model_save_path: '../models/model.pth'
 
-gat_lstm:
-  num_epochs: 25
+data:
+  lookback: 24
+  horizon: 1
+  rolling_window: 1
+  include_residual: true
+
+model:
+  embedding_dim: 16
+  gat_hidden: 64
+  gat_heads: 4
+  gat_dropout: 0.1
+  lstm_hidden: 128
+  lstm_layers: 2
+  lstm_dropout: 0.1
+
+training:
+  num_epochs: 12
   batch_size: 32
   optimizer:
-    type: "Adam"
-    learning_rate: 0.001
-  loss_function:
-    type: "MSELoss"
+    type: 'Adam'
+    lr: 0.0005
+    weight_decay: 0.0
+  scheduler:
+    type: 'ReduceLROnPlateau'
+    factor: 0.5
+    patience: 5
+  grad_clip: 1.0
+  loss_weights:
+    power: 3.0
+    onoff: 2.0
+    consistency: 0.2

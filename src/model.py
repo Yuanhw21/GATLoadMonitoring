@@ -1,105 +1,169 @@
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, TransformerConv
+from torch_geometric.nn import GATConv
 
 
-class GATFeatureExtractor(nn.Module):
-    def __init__(self, num_features, num_classes, hidden_dim=256):
-        super(GATFeatureExtractor, self).__init__()
-        # Define GAT layers
-        self.hidden_dim = hidden_dim
-        self.gat1 = GATConv(num_features, out_channels=hidden_dim // 8, heads=8, dropout=0.2)
-        self.gat2 = GATConv(in_channels=hidden_dim, out_channels=hidden_dim, heads=1, concat=False, dropout=0.2)
-        self.transformer_conv = TransformerConv(in_channels=hidden_dim,out_channels=num_classes, heads=1, dropout=0.2)
+def repeat_edge_index(edge_index: torch.Tensor, num_graphs: int, num_nodes: int) -> torch.Tensor:
+    """Tile an edge_index for a batch of identical graphs."""
+    if edge_index.dim() != 2 or edge_index.size(0) != 2:
+        raise ValueError("edge_index must have shape [2, E]")
 
-        # Residual connection
-        self.residual_connect = nn.Linear(num_features, num_classes)
-        # Add an extra linear layer to handle dimensionality change
-        self.input_projection = nn.Linear(num_features, hidden_dim)
-        # Activation function
-        self.activation = nn.Tanh()
+    device = edge_index.device
+    offsets = torch.arange(num_graphs, device=device, dtype=edge_index.dtype) * num_nodes
+    offsets = offsets.view(-1, 1)
 
-    def forward(self, x, edge_index):
-        # First GAT layer
-        # In this layer, edge weights are dynamically computed via attention
-        x1 = F.elu(self.gat1(x, edge_index))
-
-        # Second GAT layer
-        x2 = F.elu(self.gat2(x1, edge_index))
-
-        # Self-attention layer
-        x3 = self.transformer_conv(x2, edge_index)
-
-        # Residual connection
-        res_x = self.residual_connect(x)
-
-        # Combine features and residual
-        combined_x = x3 + res_x
-
-        # Activation function
-        out = self.activation(combined_x)
-        return out
+    row = edge_index[0].unsqueeze(0) + offsets
+    col = edge_index[1].unsqueeze(0) + offsets
+    return torch.stack([row.reshape(-1), col.reshape(-1)], dim=0)
 
 
-class GATLSTMPredictor(nn.Module):
-    def __init__(self, num_features, num_classes, gat_feature_extractor):
-        super(GATLSTMPredictor, self).__init__()
-        # Use the pretrained GAT model
-        self.gat_feature_extractor = gat_feature_extractor
-        # Add a fully connected layer to adjust feature dimensions
-        self.feature_transform = nn.Linear(num_features, num_classes+2)
+class GATLSTMDisaggregator(nn.Module):
+    def __init__(
+        self,
+        metadata,
+        public_feature_dim: int,
+        horizon: int = 1,
+        embedding_dim: int = 16,
+        gat_hidden_dim: int = 64,
+        gat_heads: int = 4,
+        gat_dropout: float = 0.1,
+        lstm_hidden_dim: int = 128,
+        lstm_layers: int = 2,
+        lstm_dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.metadata = metadata
+        self.public_feature_dim = public_feature_dim
+        self.horizon = horizon
+        self.include_residual = metadata.include_residual
 
-        # LSTM layers
-        self.lstm1 = nn.LSTM(input_size=num_classes+2, hidden_size=20, num_layers=2, batch_first=True, bidirectional=True)
-        self.lstm2 = nn.LSTM(input_size=40, hidden_size=20, num_layers=1, batch_first=True, bidirectional=True)
+        self.node_embedding = nn.Embedding(metadata.num_nodes, embedding_dim)
+        self.register_buffer("node_ids", torch.arange(metadata.num_nodes, dtype=torch.long))
+        self.register_buffer("device_indices", torch.tensor(metadata.device_indices, dtype=torch.long))
+        if self.include_residual:
+            self.register_buffer("residual_index", torch.tensor(1, dtype=torch.long))
+        else:
+            self.residual_index = None
 
-        # Output layer
-        self.fc = nn.Linear(40, num_classes)
-        self.dropout = nn.Dropout(p=0.2)
+        gat_input_dim = public_feature_dim + embedding_dim
+        self.gat1 = GATConv(gat_input_dim, gat_hidden_dim, heads=gat_heads, dropout=gat_dropout)
+        self.gat2 = GATConv(gat_hidden_dim * gat_heads, gat_hidden_dim, heads=1, concat=False, dropout=gat_dropout)
+        self.gat_activation = nn.ELU()
+        self.gat_dropout = nn.Dropout(gat_dropout)
 
-    def forward(self, x, edge_index):
-        # Adjust feature dimensions to match GAT input
-        transformed_features = self.feature_transform(x)
-        # Extract features using GAT
-        gat_features = self.gat_feature_extractor(transformed_features, edge_index)
+        lstm_input_dim = gat_hidden_dim
+        lstm_dropout_val = lstm_dropout if lstm_layers > 1 else 0.0
+        self.lstm = nn.LSTM(
+            input_size=lstm_input_dim,
+            hidden_size=lstm_hidden_dim,
+            num_layers=lstm_layers,
+            batch_first=True,
+            dropout=lstm_dropout_val,
+            bidirectional=True,
+        )
+        self.lstm_dropout = nn.Dropout(lstm_dropout)
 
-        # LSTM layers
-        gat_features = gat_features.unsqueeze(0)
-        gat_features, _ = self.lstm1(gat_features)
-        gat_features = self.dropout(gat_features)
-        gat_features, _ = self.lstm2(gat_features)
-        gat_features = self.dropout(gat_features)
+        decoder_input_dim = lstm_hidden_dim * 2 + embedding_dim
+        self.on_head = nn.Linear(decoder_input_dim, 1)
+        self.power_head = nn.Linear(decoder_input_dim, 1)
+        if self.include_residual:
+            self.residual_head = nn.Linear(decoder_input_dim, 1)
+        else:
+            self.residual_head = None
 
-        # Output layer
-        out = self.fc(gat_features.squeeze(0))
-        return out
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor):
+        """Forward pass.
+
+        Args:
+            x: Tensor of shape [batch, lookback, num_nodes, public_feature_dim].
+            edge_index: Graph connectivity [2, E] for a single graph.
+        Returns:
+            dict with keys:
+                'power': predictions for residual + devices (if residual enabled)
+                'device_power': predictions for devices only
+                'residual': residual predictions (or None)
+                'on_logits': logits for device on/off
+                'on_prob': sigmoid probabilities for device on/off
+        """
+
+        B, T, N, Fp = x.shape
+        if N != self.metadata.num_nodes or Fp != self.public_feature_dim:
+            raise ValueError("Input tensor shape does not match model configuration")
+
+        device = x.device
+        node_embeddings = self.node_embedding(self.node_ids.to(device))  # [N, emb]
+        node_embeddings_expanded = node_embeddings.unsqueeze(0).unsqueeze(0).expand(B, T, N, -1)
+        inputs = torch.cat([x, node_embeddings_expanded], dim=-1)
+
+        graphs = inputs.reshape(B * T, N, -1)
+        flat_inputs = graphs.reshape(B * T * N, -1)
+
+        expanded_edge_index = repeat_edge_index(edge_index.to(device), B * T, N)
+
+        gat_out = self.gat1(flat_inputs, expanded_edge_index)
+        gat_out = self.gat_activation(gat_out)
+        gat_out = self.gat_dropout(gat_out)
+        gat_out = self.gat2(gat_out, expanded_edge_index)
+        gat_out = self.gat_activation(gat_out)
+        gat_out = gat_out.reshape(B * T, N, -1)
+
+        gat_out = gat_out.reshape(B, T, N, -1).permute(0, 2, 1, 3)  # [B, N, T, G]
+        lstm_in = gat_out.reshape(B * N, T, -1)
+        lstm_out, _ = self.lstm(lstm_in)
+        lstm_out = self.lstm_dropout(lstm_out)
+        last_hidden = lstm_out[:, -1, :]
+        node_repr = last_hidden.reshape(B, N, -1)
+        node_static = node_embeddings.unsqueeze(0).expand(B, N, -1)
+        decoder_in = torch.cat([node_repr, node_static], dim=-1)
+
+        on_logits_full = self.on_head(decoder_in).squeeze(-1)
+        on_prob_full = torch.sigmoid(on_logits_full)
+        amplitude_full = F.softplus(self.power_head(decoder_in).squeeze(-1))
+
+        device_power = on_prob_full.index_select(1, self.device_indices) * amplitude_full.index_select(1, self.device_indices)
+        on_logits = on_logits_full.index_select(1, self.device_indices)
+        on_prob = on_prob_full.index_select(1, self.device_indices)
+
+        residual_pred = None
+        if self.include_residual:
+            residual_idx = int(self.residual_index.item())
+            residual_repr = decoder_in[:, residual_idx, :]
+            residual_pred = self.residual_head(residual_repr).squeeze(-1)
+            power = torch.cat([residual_pred.unsqueeze(-1), device_power], dim=1)
+        else:
+            power = device_power
+
+        return {
+            "power": power,
+            "device_power": device_power,
+            "residual": residual_pred,
+            "on_logits": on_logits,
+            "on_prob": on_prob,
+        }
 
 
-def weights_init(m):
-    if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
-        nn.init.xavier_uniform_(m.weight)  # Initialize weights of linear and conv layers with Xavier
-        if m.bias is not None:  # If bias exists
-            nn.init.constant_(m.bias, 0)  # Initialize bias to 0
-    elif isinstance(m, nn.LSTM):
-        for name, param in m.named_parameters():
-            if 'weight_ih' in name:
-                nn.init.xavier_uniform_(param.data)
-            elif 'weight_hh' in name:
-                nn.init.xavier_uniform_(param.data)
-            elif 'bias' in name:
-                param.data.fill_(0)
+def weights_init(module):
+    if isinstance(module, (nn.Linear, nn.Embedding)):
+        nn.init.xavier_uniform_(module.weight)
+        if getattr(module, "bias", None) is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.LSTM):
+        for name, param in module.named_parameters():
+            if "weight" in name:
+                nn.init.xavier_uniform_(param)
+            elif "bias" in name:
+                nn.init.zeros_(param)
 
 
-def weights_init2(m):
-    if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
-        nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')  # Initialize weights of linear and conv layers with He (Kaiming)
-        if m.bias is not None:  # If bias exists
-            nn.init.constant_(m.bias, 0)  # Initialize bias to 0
-    elif isinstance(m, nn.LSTM):
-        for name, param in m.named_parameters():
-            if 'weight_ih' in name:
-                nn.init.kaiming_uniform_(param.data, nonlinearity='relu')
-            elif 'weight_hh' in name:
-                nn.init.kaiming_uniform_(param.data, nonlinearity='relu')
-            elif 'bias' in name:
-                param.data.fill_(0)
+def weights_init2(module):
+    if isinstance(module, (nn.Linear, nn.Embedding)):
+        nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
+        if getattr(module, "bias", None) is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.LSTM):
+        for name, param in module.named_parameters():
+            if "weight" in name:
+                nn.init.kaiming_uniform_(param, nonlinearity="relu")
+            elif "bias" in name:
+                nn.init.zeros_(param)
